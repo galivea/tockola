@@ -1,0 +1,84 @@
+:root {
+  font-family: "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", -apple-system,
+    BlinkMacSystemFont, "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+  color: #2f3742;
+  background: #f2f4f8;
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+}
+
+#app {
+  height: 100%;
+}
+
+button {
+  font-family: inherit;
+}
+
+/* SvGrid 视觉微调：贴合 Windows 任务计划程序的观感 */
+.wx-willow-theme {
+  --wx-color-primary: #1a73e8;
+  --wx-table-header-background: #f6f8fb;
+  --wx-table-border: 1px solid #e8edf4;
+  --wx-border: 1px solid #e3e8ef;
+  --wx-font-size: 13px;
+}
+
+/* 单元格内容居中（表头与数据行统一） */
+.wx-willow-theme .wx-header .wx-cell,
+.wx-willow-theme .wx-row .wx-cell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+.wx-willow-theme .wx-cell > * {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.wx-willow-theme .wx-header .wx-cell {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: #5a6678;
+  padding: 0 8px;
+}
+
+.wx-willow-theme .wx-row .wx-cell {
+  padding: 0 8px;
+}
+
+.wx-willow-theme .wx-row:hover .wx-cell {
+  background: #f7fafd;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #cfd7e2;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #b6c1d0;
+  background-clip: content-box;
+}

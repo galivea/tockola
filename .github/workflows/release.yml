@@ -1,0 +1,316 @@
+name: Release
+
+# Mainstream Tauri release pipeline (v2.tauri.app/distribute/pipelines/github):
+# a v* tag drives the build, artifacts land in a *draft* GitHub Release, and a
+# human publishes it. Only a published release triggers release-publish.yml,
+# because winget-releaser cannot read assets that are still in a draft.
+#
+# Everything expressible as an assertion is automated in .github/scripts/
+# verify-release.mjs: version agreement, the exact asset set, non-empty files,
+# SHA256 digests, minisign key-id pairing and latest.json contents. The draft
+# is annotated with that machine-generated report; the human step is only
+# authorising publication of a draft that already says PASS.
+#
+# Triggers:
+#   push v*         -> full CI gate -> build + sign -> draft -> verify -> human
+#   dispatch false  -> full CI gate -> build + sign -> verify local artifacts
+#                      (no release, no winget/Scoop)
+#   dispatch true   -> same as a v* tag, for rehearsing the release path
+#
+# Secrets used here:
+#   TAURI_SIGNING_PRIVATE_KEY           required - updater signature
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD  optional - empty for this repo
+#   WINDOWS_CERTIFICATE                 optional - Authenticode pfx (base64)
+#   WINDOWS_CERTIFICATE_PASSWORD        optional
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Create a draft GitHub Release? false = build and sign only.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: Test gate
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    name: Build and sign (Windows)
+    needs: ci
+    runs-on: windows-latest
+    outputs:
+      release_tag: ${{ steps.meta.outputs.release_tag }}
+      app_version: ${{ steps.meta.outputs.app_version }}
+      release_id: ${{ steps.tauri.outputs.releaseId }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # The tag decides which version ships. If it disagrees with the config,
+      # latest.json would advertise a version installed apps see as stale.
+      - name: Resolve release metadata
+        id: meta
+        shell: pwsh
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          PUBLISH: ${{ github.event.inputs.publish }}
+        run: |
+          $conf = Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json
+          $pkg = Get-Content package.json -Raw | ConvertFrom-Json
+          if ($conf.version -ne $pkg.version) {
+            throw "version mismatch: tauri.conf.json=$($conf.version) package.json=$($pkg.version)"
+          }
+          $cargo = Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $cargo -or $cargo.Matches[0].Groups[1].Value -ne $conf.version) {
+            throw "Cargo.toml version does not match $($conf.version)"
+          }
+          $ver = $conf.version
+          $tag = "v$ver"
+          if ($env:EVENT_NAME -eq 'push' -and $env:REF_NAME -ne $tag) {
+            throw "tag $env:REF_NAME does not match version $ver (expected $tag)"
+          }
+          $publish = ($env:EVENT_NAME -eq 'push' -or $env:PUBLISH -eq 'true')
+          if ($publish) {
+            "release_tag=$tag" >> $env:GITHUB_OUTPUT
+            # The prefix is removed by the verify job once every assertion
+            # passes; a failed run leaves the draft visibly blocked.
+            "release_name=[VERIFYING] tockola $tag" >> $env:GITHUB_OUTPUT
+          } else {
+            "release_tag=" >> $env:GITHUB_OUTPUT
+            "release_name=" >> $env:GITHUB_OUTPUT
+          }
+          "app_version=$ver" >> $env:GITHUB_OUTPUT
+          Write-Output "version=$ver publish=$publish"
+
+      # A leftover draft (especially an `untagged-*` one) makes tauri-action
+      # reuse the wrong release and breaks winget/`/releases/latest`. Fail
+      # loudly instead of silently producing an unpublishable release.
+      - name: Guard against stale draft releases
+        if: steps.meta.outputs.release_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          # gh api --jq is built into the GitHub CLI; the Windows runner has no
+          # system jq, so never pipe through `jq` here.
+          DRAFTS=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '[.[] | select(.draft == true) | {id, tag_name, name}]')
+          echo "existing drafts: $DRAFTS"
+          COUNT=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '[.[] | select(.draft == true)] | length')
+          echo "draft count: $COUNT"
+          if [ "$COUNT" -ne 0 ]; then
+            echo "::error::stale draft releases found; delete them before publishing $RELEASE_TAG"
+            gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+              --jq '.[] | select(.draft == true) | "  id=\(.id) tag=\(.tag_name) name=\(.name)"'
+            echo "delete with: gh api -X DELETE repos/$GITHUB_REPOSITORY/releases/<id>"
+            exit 1
+          fi
+          echo "no stale drafts: OK"
+
+      - run: npm ci
+
+      # With no tagName / releaseName / releaseId, tauri-action builds and signs
+      # but neither creates nor uploads to a release (see its README). A draft
+      # is always created first; publishing stays a deliberate human action.
+      - uses: tauri-apps/tauri-action@v1
+        id: tauri
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        with:
+          tagName: ${{ steps.meta.outputs.release_tag }}
+          releaseName: ${{ steps.meta.outputs.release_name }}
+          releaseBody: 'Automated verification in progress — do not publish yet.'
+          releaseDraft: true
+          prerelease: false
+          uploadUpdaterJson: ${{ steps.meta.outputs.release_tag != '' }}
+          args: ''
+
+      # GitHub can return `untagged-<hash>` for a freshly created draft even
+      # when tauri-action passed a real tagName. Bind it explicitly and assert
+      # the result; an unbound draft would break winget and /releases/latest.
+      - name: Bind draft release to the version tag
+        if: steps.meta.outputs.release_tag != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.meta.outputs.release_tag }}
+          RELEASE_ID: ${{ steps.tauri.outputs.releaseId }}
+        run: |
+          set -euo pipefail
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::tauri-action did not return a releaseId"
+            exit 1
+          fi
+          echo "release id=$RELEASE_ID expected tag=$RELEASE_TAG"
+          CURRENT=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.tag_name' | tr -d '"\r')
+          echo "current tag_name=$CURRENT"
+          if [ "$CURRENT" != "$RELEASE_TAG" ]; then
+            echo "draft is unbound; patching tag_name to $RELEASE_TAG"
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+              -f tag_name="$RELEASE_TAG" > /dev/null
+            CURRENT=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.tag_name' | tr -d '"\r')
+            echo "tag_name after patch=$CURRENT"
+          fi
+          if [ "$CURRENT" != "$RELEASE_TAG" ]; then
+            echo "::error::failed to bind draft to $RELEASE_TAG (got $CURRENT)"
+            exit 1
+          fi
+          echo "draft bound to $CURRENT: OK"
+
+      - name: Package portable zip and upload
+        if: steps.meta.outputs.release_tag != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_VERSION: ${{ steps.meta.outputs.app_version }}
+          # Use the upload url from tauri-action: `gh release upload <tag>`
+          # resolves through /releases/tags/:tag, which cannot see drafts.
+          RELEASE_UPLOAD_URL: ${{ steps.tauri.outputs.releaseUploadUrl }}
+        run: |
+          $zip = "tockola_$($env:APP_VERSION)_x64_portable.zip"
+          Compress-Archive -Path "src-tauri/target/release/tockola.exe" -DestinationPath $zip -Force
+          $url = $env:RELEASE_UPLOAD_URL -replace '\{\?name,label\}', "?name=$zip"
+          curl.exe -fsS -X POST `
+            -H "Authorization: Bearer $env:GH_TOKEN" `
+            -H "Content-Type: application/zip" `
+            --data-binary "@$zip" $url
+          if ($LASTEXITCODE -ne 0) { throw "portable zip upload failed with exit $LASTEXITCODE" }
+
+      # Dry-run path: no release exists, so verify the built files in place.
+      # latest.json and the portable zip are skipped here by design.
+      - name: Verify local build artifacts
+        if: steps.meta.outputs.release_tag == ''
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.meta.outputs.app_version }}
+        run: |
+          node .github/scripts/verify-release.mjs --artifacts src-tauri/target/release/bundle --version $env:APP_VERSION --summary verify-notes.md --report verify-report.json
+
+      - name: Upload verification artifacts
+        if: always() && steps.meta.outputs.release_tag == ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: tockola-verify-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            src-tauri/target/release/bundle/msi/*.msi
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/**/*.sig
+            src-tauri/target/release/tockola.exe
+            verify-report.json
+            verify-notes.md
+
+  verify:
+    name: Automated verification
+    needs: release
+    if: needs.release.outputs.release_tag != ''
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Verify draft release assets
+        id: verify
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
+          RELEASE_ID: ${{ needs.release.outputs.release_id }}
+          APP_VERSION: ${{ needs.release.outputs.app_version }}
+        run: |
+          node .github/scripts/verify-release.mjs \
+            --release "$RELEASE_TAG" \
+            --release-id "$RELEASE_ID" \
+            --version "$APP_VERSION" \
+            --summary verify-notes.md \
+            --report verify-report.json
+
+      # Runs even when verification fails, so the draft itself always carries
+      # the verdict instead of relying on someone reading the workflow log.
+      - name: Annotate draft with verification summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
+          RELEASE_ID: ${{ needs.release.outputs.release_id }}
+        run: |
+          if [ ! -f verify-report.json ] || [ ! -f verify-notes.md ]; then
+            echo "::error::verification produced no report; leaving the draft unverified"
+            exit 1
+          fi
+          if [ -z "$RELEASE_ID" ]; then
+            echo "::error::tauri-action did not return a releaseId"
+            exit 1
+          fi
+          RESULT=$(jq -r .result verify-report.json)
+          if [ "$RESULT" = "PASS" ]; then
+            TITLE="tockola $RELEASE_TAG"
+          else
+            TITLE="[BLOCKED] tockola $RELEASE_TAG"
+          fi
+          # GitHub resets a draft to an `untagged-*` placeholder when a PATCH
+          # omits tag_name. Always send it, then read the release back so a
+          # regression fails the run instead of producing a green but broken draft.
+          jq -n --arg name "$TITLE" --arg tag_name "$RELEASE_TAG" --rawfile body verify-notes.md \
+            '{name: $name, tag_name: $tag_name, body: $body}' > release-payload.json
+          gh api -X PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            --input release-payload.json > /dev/null
+          ACTUAL_TAG=$(gh api "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" --jq '.tag_name' | tr -d '"\r')
+          echo "tag_name after annotation=$ACTUAL_TAG"
+          if [ "$ACTUAL_TAG" != "$RELEASE_TAG" ]; then
+            echo "::error::draft lost its tag during annotation (expected $RELEASE_TAG, got $ACTUAL_TAG)"
+            exit 1
+          fi
+          echo "draft annotated: $TITLE ($RESULT)"
+
+      - name: Upload verification report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tockola-verify-report-${{ github.run_id }}
+          if-no-files-found: warn
+          retention-days: 30
+          path: |
+            verify-report.json
+            verify-notes.md
+
+      - name: Fail if verification did not pass
+        if: always() && steps.verify.outcome == 'failure'
+        run: |
+          echo "::error::Automated verification failed. The draft is marked [BLOCKED]; do not publish it."
+          exit 1

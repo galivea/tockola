@@ -1,0 +1,55 @@
+[package]
+name = "tockola"
+version = "0.0.1"
+description = "Cron-powered GUI for Windows Task Scheduler"
+authors = ["Tockola contributors"]
+license = "MIT"
+edition = "2021"
+
+[lib]
+name = "tockola_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+# 前端 UI 状态（查询条件 / 树展开 / 滚动位置）落到 app data 目录下的 JSON 文件，
+# 不用 WebView 的浏览器存储：后者挂在缓存目录里，会被系统清扫或在 Tauri 升级时整段丢失。
+tauri-plugin-store = "2"
+# 导入导出任务 XML 需要系统文件对话框（保存路径 / 打开路径）
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 只用任务计划程序这一块 COM 接口（IRegisteredTask::GetRunTimes 拿权威执行时刻）。
+# 版本与 tauri 依赖的 windows 保持一致，避免编译出两份。
+windows = { version = "0.62.2", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_System_Com",
+  "Win32_System_EventLog",
+  "Win32_System_Ole",
+  "Win32_System_TaskScheduler",
+  "Win32_System_Threading",
+  "Win32_System_Variant",
+  "Win32_System_SystemInformation",
+] }
+# Task XML 的读写不再由我们实现：改走 COM 的对象模型（见 src/taskdef.rs），
+# 因此不再需要 XML 解析库。chrono 仍用于 COM DATE 与起始时刻的换算。
+chrono = { version = "0.4.45", features = ["clock", "std"] }
+tauri-plugin-updater = "2.14.0"
+
+[dev-dependencies]
+# tauri::test 提供 mock_builder / get_ipc_response，让测试直接打 IPC 边界。
+# 之前所有测试都绕过命令层去调它内部调用的函数，导致命令层的 JSON 契约
+# （字段语义、取值域）完全没有覆盖 —— 缺陷正是从那里漏出来的。
+# tauri = { version = "2", features = ["test"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

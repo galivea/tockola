@@ -1,0 +1,65 @@
+name: CI
+
+# Three-layer test gate on every push and PR. Also callable from release.yml so
+# a tagged build cannot ship before the full suite passes.
+on:
+  push:
+    branches: [master, main]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    name: Frontend unit tests (Vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # Pinned in .nvmrc: jsdom 30 / undici 8 need Node >= 22.19. On Node 20
+          # undici calls zlib.createZstdDecompress.bind() and all workers crash.
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      - run: npm run test:unit
+
+  rust:
+    name: Rust tests (unit + IPC contract)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+      # The contract tests touch the real Task Scheduler service, so Windows only.
+      - run: cargo test --manifest-path src-tauri/Cargo.toml
+
+  e2e:
+    name: End-to-end (Playwright + Edge)
+    runs-on: windows-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+      - run: npm ci
+      # Reuse the system Edge instead of downloading Playwright browsers: the
+      # desktop app uses the same engine, so this matches real behaviour.
+      - run: npm run test:e2e
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-trace
+          path: test-results
+          retention-days: 7

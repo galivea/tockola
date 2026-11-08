@@ -1,0 +1,56 @@
+node_modules
+dist
+dist-ssr
+*.local
+
+# Playwright output (traces / screenshots / reports)
+test-results
+playwright-report
+blob-report
+
+# Throwaway scripts used while investigating; never commit them
+.tmp-*
+
+# Rust
+src-tauri/target
+
+# Tauri build output (productName = Tockola).
+# With bundle=none the exe lands in the repository root — keep it out.
+tockola.exe
+
+# Output placeholders for the script channel. A normal run replaces them with a
+# temp path; one sitting in the root means a run never got that far.
+__OUT_FILE__
+__PAYLOAD_FILE__
+
+# logs
+*.log
+npm-debug.log*
+
+# Release staging (used by .github/workflows/release.yml: artifacts pending
+# release, and the SignPath signing fallback directory)
+out
+signed
+# 私有工作区：本地发布脚本、内部文档（docs 已私有化迁到 .task/md/，不公开）。
+# 显式列出 .task/md/ 以表明开发文档不进仓库。
+.task
+.task/md
+.agents
+
+# 本机 cargo 代理配置（含内网代理地址，各机不同，不进仓库）
+.cargo
+
+# 发布产物（release.yml 产出，仅进 GitHub Release，不进仓库）
+*.nsis
+*.msi
+*.zip
+*.sig
+
+# 内部 AI 编排入口（在 project-manage 侧是软链接，公开仓库里无意义）
+AGENTS.md
+
+# Tauri updater 签名私钥（绝不可入库）。
+# 公钥已写入 src-tauri/tauri.conf.json 的 plugins.updater.pubkey，
+# 私钥只放 CI 的 TAURI_SIGNING_PRIVATE_KEY。
+*.key
+src-tauri/tauri.key
