@@ -23,7 +23,8 @@ on:
 
 permissions:
   contents: write   # gh release download in the Scoop job uses GITHUB_TOKEN;
-                    # winget uses WINGET_TOKEN, Scoop pushes with SCOOP_BUCKET_TOKEN
+                    # winget uses WINGET_TOKEN, Scoop pushes with
+                    # SCOOP_BUCKET_TOKEN (or falls back to WINGET_TOKEN)
 
 env:
   # These jobs do not check out the repository, so gh cannot infer the target
@@ -71,10 +72,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # winget-releaser can only update an existing package. The first
-          # version must be submitted with `wingetcreate new --submit` and
-          # reviewed by Microsoft, so skip with a clear notice instead of
-          # failing the whole distribution run on the very first release.
+          # winget-releaser can only update an existing package. A first
+          # version is registered by submitting multi-file manifests as a PR
+          # (winget-create's `new` is an interactive wizard with no --submit;
+          # `--submit` belongs to `update` and only works for registered
+          # packages), then reviewed by Microsoft. Skip with a clear notice
+          # instead of failing the whole run on the very first release.
           STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GH_TOKEN" \
@@ -88,7 +91,7 @@ jobs:
       - name: Report the first-submission requirement
         if: steps.registration.outputs.registered == 'false'
         run: |
-          echo "::notice title=Winget first submission required::Galivea.Tockola is not in microsoft/winget-pkgs yet. Register the first version with wingetcreate new --submit, then rerun this workflow for the next release."
+          echo "::notice title=Winget first submission required::Galivea.Tockola is not in microsoft/winget-pkgs yet. Submit the first version's multi-file manifests as a PR and let Microsoft review it; this workflow opens update PRs automatically once the package is registered."
 
       - name: Submit manifest update
         if: steps.registration.outputs.registered == 'true'
@@ -133,12 +136,23 @@ jobs:
 
       - name: Push to galivea/scoop-bucket
         env:
-          TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          BUCKET_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          # WINGET_TOKEN is a classic PAT with public_repo + workflow. The bucket
+          # is public, so it can push there too. Prefer the dedicated fine-grained
+          # token when present, but do not hard-fail on a first release just
+          # because that one extra Secret has not been configured yet.
+          WINGET_PAT: ${{ secrets.WINGET_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VER="${RELEASE_TAG#v}"
-          if [ -z "$TOKEN" ]; then
-            echo "::error::SCOOP_BUCKET_TOKEN secret is not set; cannot push to galivea/scoop-bucket"
+          if [ -n "$BUCKET_TOKEN" ]; then
+            TOKEN="$BUCKET_TOKEN"
+            echo "using SCOOP_BUCKET_TOKEN for the Scoop bucket push"
+          elif [ -n "$WINGET_PAT" ]; then
+            TOKEN="$WINGET_PAT"
+            echo "SCOOP_BUCKET_TOKEN is unset; falling back to WINGET_TOKEN (classic PAT, public_repo) for the public bucket"
+          else
+            echo "::error::neither SCOOP_BUCKET_TOKEN nor WINGET_TOKEN is set; cannot push to galivea/scoop-bucket"
             exit 1
           fi
           git clone https://x-access-token:${TOKEN}@github.com/galivea/scoop-bucket.git bucket
