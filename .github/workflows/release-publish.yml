@@ -127,7 +127,8 @@ jobs:
             --arg v "$VER" \
             --arg url "$URL" \
             --arg hash "$HASH" \
-            '{version:$v, description:"Cron-powered GUI for Windows Task Scheduler, focused on the tasks you created.", homepage:"https://github.com/galivea/tockola", license:"MIT", architecture:{64bit:{url:$url, hash:$hash}}, bin:"tockola.exe", checkver:"github", autoupdate:{architecture:{64bit:{url:$url}}}}' > tockola.json
+            '{version:$v, description:"Cron-powered GUI for Windows Task Scheduler, focused on the tasks you created.", homepage:"https://github.com/galivea/tockola", license:"MIT", architecture:{"64bit":{url:$url, hash:$hash}}, bin:"tockola.exe", checkver:"github", autoupdate:{architecture:{"64bit":{url:"https://github.com/galivea/tockola/releases/download/v$version/tockola_$version_x64_portable.zip"}}}}' > tockola.json
+          jq -e 'has("version") and (.architecture["64bit"].hash | length == 64)' tockola.json > /dev/null
           cat tockola.json
 
       - name: Push to galivea/scoop-bucket
