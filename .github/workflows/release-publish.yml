@@ -1,10 +1,10 @@
 name: Publish package managers
 
-# Decoupled from release.yml: only runs once a draft is promoted to a published
-# release. At that point the assets (msi / nsis / portable zip / latest.json)
-# are stable and public, so winget and Scoop can consume them. A failure here
-# never rolls back an already published release, and failed jobs can be rerun
-# on their own.
+# Decoupled from release.yml: runs when a draft is promoted to a published
+# release, and can also be dispatched manually for an already published tag.
+# At that point the assets (msi / nsis / portable zip / latest.json) are stable
+# and public, so winget and Scoop can consume them. A failure here never rolls
+# back an already published release, and failed jobs can be rerun on their own.
 #
 # The guard refuses to distribute a release without the automated verification
 # PASS marker written by release.yml. It is a second line of defence: a hand-
@@ -14,13 +14,27 @@ name: Publish package managers
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag of an already published release to distribute, e.g. v0.0.1'
+        required: true
+        type: string
 
 permissions:
-  contents: write   # only for `gh release download` in the Scoop job;
+  contents: write   # gh release download in the Scoop job uses GITHUB_TOKEN;
                     # winget uses WINGET_TOKEN, Scoop pushes with SCOOP_BUCKET_TOKEN
 
+env:
+  # These jobs do not check out the repository, so gh cannot infer the target
+  # repository from a local git remote. Without GH_REPO every `gh release ...`
+  # call fails with "fatal: not a git repository" before any API request.
+  GH_REPO: ${{ github.repository }}
+  # release events carry the tag in the payload; manual runs carry it as an input.
+  RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
+
 concurrency:
-  group: publish-${{ github.ref }}
+  group: publish-${{ inputs.tag || github.event.release.tag_name || github.ref_name }}
   cancel-in-progress: false
 
 jobs:
@@ -34,32 +48,56 @@ jobs:
         run: |
           # A draft that lost its tag during annotation would publish as
           # `untagged-*`; refuse to distribute anything that is not vX.Y.Z.
-          if ! [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::release tag $GITHUB_REF_NAME is not a vX.Y.Z version tag."
+          if ! [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::release tag '$RELEASE_TAG' is not a vX.Y.Z version tag."
             echo "A draft that lost its tag (untagged-*) must not be published."
             exit 1
           fi
-          BODY=$(gh release view "$GITHUB_REF_NAME" --json body --jq .body)
+          BODY=$(gh release view "$RELEASE_TAG" --json body --jq .body)
           if ! grep -q '<!-- tockola-verify: PASS' <<< "$BODY"; then
-            echo "::error::$GITHUB_REF_NAME was not produced by the verified release pipeline."
+            echo "::error::$RELEASE_TAG was not produced by the verified release pipeline."
             echo "Hand-made releases and drafts marked [BLOCKED] must not be distributed."
             exit 1
           fi
-          echo "automated verification PASS confirmed for $GITHUB_REF_NAME"
+          echo "automated verification PASS confirmed for $RELEASE_TAG"
 
   winget:
     name: Submit to winget (PR to microsoft/winget-pkgs)
     needs: guard
-    runs-on: windows-latest   # winget-releaser requires a Windows runner
+    runs-on: ubuntu-latest
     steps:
-      - uses: vedantmgoyal2009/winget-releaser@v1
+      - name: Check whether the package is already registered
+        id: registration
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # winget-releaser can only update an existing package. The first
+          # version must be submitted with `wingetcreate new --submit` and
+          # reviewed by Microsoft, so skip with a clear notice instead of
+          # failing the whole distribution run on the very first release.
+          STATUS=$(curl -sS -o /dev/null -w "%{http_code}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/g/Galivea/Tockola")
+          case "$STATUS" in
+            200) echo "registered=true" >> "$GITHUB_OUTPUT" ;;
+            404) echo "registered=false" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::unexpected HTTP $STATUS while checking winget-pkgs"; exit 1 ;;
+          esac
+
+      - name: Report the first-submission requirement
+        if: steps.registration.outputs.registered == 'false'
+        run: |
+          echo "::notice title=Winget first submission required::Galivea.Tockola is not in microsoft/winget-pkgs yet. Register the first version with wingetcreate new --submit, then rerun this workflow for the next release."
+
+      - name: Submit manifest update
+        if: steps.registration.outputs.registered == 'true'
+        uses: vedantmgoyal9/winget-releaser@v2
         with:
           identifier: Galivea.Tockola
-          # No explicit version: the action strips the v prefix from the release
-          # tag (v0.0.1 -> 0.0.1), matching what wingetcreate registered.
-          # A classic PAT (public_repo + workflow) is required; GITHUB_TOKEN
-          # cannot fork/push microsoft/winget-pkgs and fine-grained PATs are
-          # not supported by this action.
+          # The action defaults to github.ref_name, which is `master` for a
+          # workflow_dispatch run. Always pass the resolved release tag.
+          release-tag: ${{ env.RELEASE_TAG }}
           token: ${{ secrets.WINGET_TOKEN }}
           installers-regex: '\.msi$'
           # fork-user defaults to github.repository_owner = galivea, which owns
@@ -75,10 +113,14 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${GITHUB_REF_NAME}"
+          TAG="$RELEASE_TAG"
           VER="${TAG#v}"
           ASSET="tockola_${VER}_x64_portable.zip"
           gh release download "$TAG" -p "$ASSET" -D ./dl
+          if ! test -s "./dl/$ASSET"; then
+            echo "::error::downloaded asset $ASSET is missing or empty"
+            exit 1
+          fi
           HASH=$(sha256sum "./dl/$ASSET" | awk '{print $1}')
           URL="https://github.com/galivea/tockola/releases/download/$TAG/$ASSET"
           jq -n \
@@ -91,9 +133,9 @@ jobs:
       - name: Push to galivea/scoop-bucket
         env:
           TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
-          GH_TOKEN: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          VER="${GITHUB_REF_NAME#v}"
+          VER="${RELEASE_TAG#v}"
           if [ -z "$TOKEN" ]; then
             echo "::error::SCOOP_BUCKET_TOKEN secret is not set; cannot push to galivea/scoop-bucket"
             exit 1
